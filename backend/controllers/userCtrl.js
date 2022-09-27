@@ -1,27 +1,23 @@
 const User = require("../models/User");
 const EmailVerificationToken = require("../models/emailVerificationToken");
-const nodemailer = require("nodemailer");
 const { isValidObjectId } = require("mongoose");
+const { generateOTP, generateMailTransporter } = require("../utlis/mail");
+const { sendError, generateRandomByte } = require("../utlis/helper");
+const PasswordResetToken = require("../models/passwordResetToken");
+const jwt = require("jsonwebtoken");
 
 exports.create = async (req, res) => {
   const { name, email, password } = req.body;
 
   const oldUser = await User.findOne({ email });
 
-  if (oldUser)
-    return res.status(401).json({ error: "Email is already in use" });
+  if (oldUser) return sendError(res, "Email is already in use");
 
   const newUser = new User({ name, email, password });
   await newUser.save();
 
   // Generate 6 Digit OTP
-  let OTP = "";
-
-  for (let i = 0; i <= 5; i++) {
-    const randomVal = Math.round(Math.random() * 9);
-
-    OTP += randomVal;
-  }
+  const OTP = generateOTP(6);
 
   const newEmailVerificationToken = new EmailVerificationToken({
     owner: newUser._id,
@@ -30,14 +26,7 @@ exports.create = async (req, res) => {
 
   await newEmailVerificationToken.save();
 
-  var transport = nodemailer.createTransport({
-    host: "smtp.mailtrap.io",
-    port: 2525,
-    auth: {
-      user: "a587bc4e5cd48d",
-      pass: "8226d8eeb30bab",
-    },
-  });
+  var transport = generateMailTransporter();
 
   transport.sendMail({
     from: "verification@moviewreview.com",
@@ -62,17 +51,17 @@ exports.verifyEmail = async (req, res) => {
 
   const user = await User.findById(userId);
 
-  if (!user) return res.json({ error: "User not found" });
+  if (!user) return sendError(res, "User not found", 404);
 
-  if (user.isVerified) return res.json({ error: "User is already verified" });
+  if (user.isVerified) return sendError(res, "User is already verified");
 
   const token = await EmailVerificationToken.findOne({ owner: userId });
 
-  if (!token) return res.json({ error: "Token not found" });
+  if (!token) return sendError(res, "Token not found");
 
   const isMatched = await token.compareToken(OTP);
 
-  if (!isMatched) return res.json({ error: "Please enter valid OTP" });
+  if (!isMatched) return sendError(res, "Please enter valid OTP");
 
   user.isVerified = true;
   await user.save();
@@ -81,14 +70,7 @@ exports.verifyEmail = async (req, res) => {
 
   res.json({ message: "Your email is verified" });
 
-  var transport = nodemailer.createTransport({
-    host: "smtp.mailtrap.io",
-    port: 2525,
-    auth: {
-      user: "a587bc4e5cd48d",
-      pass: "8226d8eeb30bab",
-    },
-  });
+  var transport = generateMailTransporter();
 
   transport.sendMail({
     from: "verification@moviewreview.com",
@@ -106,28 +88,23 @@ exports.resendEmailVerificationToken = async (req, res) => {
 
   const user = await User.findById(userId);
 
-  if (!user) return res.json({ error: "User not found" });
+  if (!user) return sendError(res, "User not found");
 
   if (user.isVerified)
-    return res.json({ error: "This email id is already verified" });
+    return sendError(res, "This email id is already verified");
 
   const alreadyToken = await EmailVerificationToken.findOne({
     owner: userId,
   });
 
   if (alreadyToken)
-    return res.json({
-      error: "Only after one hour you can request for another token",
-    });
+    return sendError(
+      res,
+      "Only after one hour you can request for another token"
+    );
 
-  // Generate 6 Digit OTP
-  let OTP = "";
-
-  for (let i = 0; i <= 5; i++) {
-    const randomVal = Math.round(Math.random() * 9);
-
-    OTP += randomVal;
-  }
+  // OTP
+  const OTP = generateOTP(6);
 
   const newEmailVerificationToken = new EmailVerificationToken({
     owner: user._id,
@@ -136,14 +113,7 @@ exports.resendEmailVerificationToken = async (req, res) => {
 
   await newEmailVerificationToken.save();
 
-  var transport = nodemailer.createTransport({
-    host: "smtp.mailtrap.io",
-    port: 2525,
-    auth: {
-      user: "a587bc4e5cd48d",
-      pass: "8226d8eeb30bab",
-    },
-  });
+  var transport = generateMailTransporter();
 
   transport.sendMail({
     from: "verification@moviewreview.com",
@@ -156,5 +126,99 @@ exports.resendEmailVerificationToken = async (req, res) => {
   });
   res.status(201).json({
     message: "Please verify your email. OTP has been sent to your email",
+  });
+};
+
+exports.forgetPassword = async (req, res) => {
+  const { email } = req.body;
+
+  if (!email) return sendError(res, "Email is required");
+
+  const user = await User.findOne({ email });
+  if (!user) return sendError(res, "User not found", 404);
+
+  const alreadyToken = await PasswordResetToken.findOne({ owner: user._id });
+  if (alreadyToken) return sendError(res, "Try again after one hour");
+
+  const token = await generateRandomByte();
+  const newPasswordResetToken = await PasswordResetToken({
+    owner: user._id,
+    token,
+  });
+
+  await newPasswordResetToken.save();
+
+  const resetPasswordUrl = `http://localhost:3000/reset-password?token=${token}&id=${user._id}`;
+
+  var transport = generateMailTransporter();
+
+  transport.sendMail({
+    from: "security@moviewreview.com",
+    to: user.email,
+    subject: "Reset Password Link",
+    html: `
+      <p>Click here to reset password</p>
+      <a href='${resetPasswordUrl}'>Click Here</a>
+    `,
+  });
+
+  res.status(201).json({
+    message: "Password Reset Link sent to your email",
+  });
+};
+
+exports.sendResetPasswordTokenStatus = async (req, res) => {
+  res.json({ valid: true });
+};
+
+exports.resetPassword = async (req, res) => {
+  const { newPassword, userId } = req.body;
+
+  const user = await User.findById(userId);
+
+  const matched = await user.comparePassword(newPassword);
+  if (matched)
+    return sendError(
+      res,
+      "The new password must be different from the old one!"
+    );
+
+  user.password = newPassword;
+  await user.save();
+
+  await PasswordResetToken.findByIdAndDelete(req.resetToken._id);
+
+  var transport = generateMailTransporter();
+
+  transport.sendMail({
+    from: "security@moviewreview.com",
+    to: user.email,
+    subject: "Password Changed Successfully",
+    html: `
+      <p>Your Password has been changed successfully</p>
+    `,
+  });
+
+  res.status(201).json({
+    message: "Password changed successfully",
+  });
+};
+
+exports.signIn = async (req, res) => {
+  const { email, password } = req.body;
+
+  const user = await User.findOne({ email });
+
+  if (!user) return sendError(res, "Credentials Invalid");
+
+  const matched = await user.comparePassword(password);
+  if (!matched) return sendError(res, "Credentials Invalid");
+
+  const token = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, {
+    expiresIn: "7d",
+  });
+
+  res.json({
+    user: { id: user._id, name: user.name, email: user.email, token },
   });
 };
